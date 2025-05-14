@@ -2,7 +2,7 @@ name: Generate AI-ENGAGE RSS Feed
 
 on:
   schedule:
-    - cron: '10 1 * * *'        # JST 10:10
+    - cron: '10 1 * * *'        # JST 10:10 毎日
   workflow_dispatch:
 
 jobs:
@@ -13,64 +13,75 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Install Python deps
-      run: python -m pip install --upgrade requests
+      run: python -m pip install --upgrade requests beautifulsoup4 lxml
 
     - name: Build RSS via Python
       run: |
         python <<'PY'
-        import requests, datetime, email.utils, html, pathlib, json, sys
+        import requests, datetime, email.utils, html, pathlib, json, sys, re
 
-        BASE_URL  = "https://www.jst.go.jp"
-        JSON_URL  = f"{BASE_URL}/moonshot/ai-engage/js/newsitem_js.json"
+        BASE_URL = "https://www.jst.go.jp"
+        JSON_URL = f"{BASE_URL}/moonshot/ai-engage/js/newsitem_js.json"
 
-        # --- JSON 取得（BOM を除去してパース） -------------------------------
+        # --- JSON取得（BOM対応） ---
+        raw  = requests.get(JSON_URL, timeout=20).content
+        text = raw.decode("utf-8-sig")
         try:
-            raw = requests.get(JSON_URL, timeout=20).content
-            text = raw.decode("utf-8-sig")           # ⭐ UTF-8-BOM を吸収
             data = json.loads(text)
         except Exception as e:
             sys.exit(f"::error::JSON取得失敗: {e}")
 
-        # --- 配列に辿り着く --------------------------------------------------
+        # --- 配列に辿り着く ---
         if isinstance(data, list):
             items = data
         else:
-            # dict のいずれかのキーにリストがある
-            for k in ("news", "items", "values"):
+            for k in ("news","items","values"):
                 if isinstance(data.get(k), list):
-                    items = data[k]
-                    break
+                    items = data[k]; break
             else:
-                sys.exit("::error::JSON構造に記事配列が見つかりません")
+                sys.exit("::error::記事配列が見つかりません")
 
-        # --- RSS 組立 -------------------------------------------------------
+        # --- RSSヘッダ ---
         out = [
-            '<?xml version="1.0" encoding="UTF-8"?>',
-            '<rss version="2.0"><channel>',
-            '<title>AI-ENGAGE NEWS</title>',
-            f'<link>{BASE_URL}/moonshot/ai-engage/news.html</link>',
-            '<description>JST AI-ENGAGE の新着情報</description>',
+          '<?xml version="1.0" encoding="UTF-8"?>',
+          '<rss version="2.0"><channel>',
+          '<title>AI-ENGAGE NEWS</title>',
+          f'<link>{BASE_URL}/moonshot/ai-engage/news.html</link>',
+          '<description>JST AI-ENGAGE の新着情報</description>'
         ]
 
-        for itm in items[:30]:                       # 最大30件
-            title = html.escape(itm.get("title", ""))
-            link  = itm.get("url") or itm.get("link") or ""
-            if link.startswith("/"):
-                link = BASE_URL + link
+        # --- 各アイテム処理 ---
+        for itm in items[:30]:
+            # 日付取得
             date_raw = itm.get("date") or itm.get("news_date") or ""
-            try:
-                dt = datetime.datetime.strptime(date_raw, "%Y/%m/%d")
-            except ValueError:
+            dt = None
+            for fmt in ("%Y/%m/%d","%Y-%m-%d"):
                 try:
-                    dt = datetime.datetime.strptime(date_raw, "%Y-%m-%d")
-                except ValueError:
-                    dt = datetime.datetime.utcnow()
+                    dt = datetime.datetime.strptime(date_raw, fmt)
+                    break
+                except:
+                    continue
+            if not dt:
+                dt = datetime.datetime.utcnow()
             pub = email.utils.format_datetime(dt)
 
-            out.append(
-                f"<item><title>{title}</title>"
-                f"<link>{link}</link><pubDate>{pub}</pubDate></item>"
-            )
+            # タイトル動的抽出
+            title = ""
+            for v in itm.values():
+                if isinstance(v, str):
+                    # 日付やパスではない文字列をタイトルとみなす
+                    if not re.match(r"\d{4}[-/]\d{2}[-/]\d{2}", v) and not v.startswith("/"):
+                        title = html.escape(v)
+                        break
+
+            # リンク動的抽出
+            link = ""
+            for v in itm.values():
+                if isinstance(v, str) and v.startswith("/"):
+                    link = BASE_URL + v
+                    break
+
+            out.append(f"<item><title>{title}</title><link>{link}</link><pubDate>{pub}</pubDate></item>")
 
         out.append("</channel></rss>")
         pathlib.Path("new_rss.xml").write_text("\n".join(out), encoding="utf-8")
