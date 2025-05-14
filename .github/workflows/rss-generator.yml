@@ -1,0 +1,91 @@
+name: Generate AI-ENGAGE RSS Feed
+
+on:
+  schedule:
+    - cron: '10 1 * * *'          # JST 10:10 に毎日実行
+  workflow_dispatch:               # 手動トリガーも可
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    #―― リポジトリ checkout ――#
+    - uses: actions/checkout@v4
+
+    #―― 必要ライブラリ ――#
+    - name: Install Python deps
+      run: python -m pip install --upgrade requests
+
+    #―― JSON → RSS 生成 ――#
+    - name: Build RSS via Python
+      run: |
+        python <<'PY'
+        import requests, datetime, email.utils, html, pathlib, sys, json
+
+        JSON_URL = "https://www.jst.go.jp/moonshot/ai-engage/js/newsitem_js.json"
+        BASE_URL = "https://www.jst.go.jp"
+
+        try:
+            data = requests.get(JSON_URL, timeout=20).json()
+        except Exception as e:
+            sys.exit(f"::error::JSON取得失敗: {e}")
+
+        # 柔軟に items を取り出す
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            # news / items / values のどれかに入っていそう
+            items = (
+                data.get("news")
+                or data.get("items")
+                or next(iter(data.values()), [])
+            )
+        else:
+            sys.exit("::error::予期しないJSON構造")
+
+        out = ['<?xml version="1.0" encoding="UTF-8"?>',
+               '<rss version="2.0"><channel>',
+               '<title>AI-ENGAGE NEWS</title>',
+               f'<link>{BASE_URL}/moonshot/ai-engage/news.html</link>',
+               '<description>JST AI-ENGAGE の新着情報</description>']
+
+        # 最新20件程度あれば十分
+        for itm in items[:20]:
+            title = html.escape(itm.get("title", ""))
+            link  = itm.get("url") or itm.get("link") or ""
+            if link.startswith("/"):
+                link = BASE_URL + link
+            # 日付は YYYY/MM/DD or YYYY-MM-DD 想定
+            date_raw = itm.get("date") or itm.get("news_date") or ""
+            try:
+                dt = datetime.datetime.strptime(date_raw, "%Y/%m/%d")
+            except ValueError:
+                try:
+                    dt = datetime.datetime.strptime(date_raw, "%Y-%m-%d")
+                except ValueError:
+                    dt = datetime.datetime.utcnow()
+            pub = email.utils.format_datetime(dt)
+            out.append(f"<item><title>{title}</title><link>{link}</link><pubDate>{pub}</pubDate></item>")
+
+        out.append('</channel></rss>')
+        pathlib.Path("new_rss.xml").write_text("\n".join(out), encoding="utf-8")
+        PY
+
+    #―― 差分チェック & ステージ ――#
+    - name: Stage RSS if changed
+      run: |
+        if [ -f rss.xml ] && cmp -s new_rss.xml rss.xml; then
+          echo "No content change"; exit 0; fi
+        mv new_rss.xml rss.xml
+        git add rss.xml
+
+    #―― コミット & プッシュ（初回も確実に） ――#
+    - name: Commit & push
+      run: |
+        if git diff --cached --quiet; then
+          echo "Nothing to commit"; exit 0; fi
+        git config --global user.name  github-actions
+        git config --global user.email github-actions@github.com
+        git commit -m "Update AI-ENGAGE RSS feed"
+        git push
